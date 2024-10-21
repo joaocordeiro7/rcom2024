@@ -22,7 +22,7 @@ Instructions to Run the Project
 3. Run the virtual cable program (either by running the executable manually or using the Makefile target):
 	$ sudo ./bin/cable_app
 	$ sudo make run_cable
-
+	
 4. Test the protocol without cable disconnections and noise
 	4.1 Run the receiver (either by running the executable manually or using the Makefile target):
 		$ ./bin/main /dev/ttyS11 9600 rx penguin-received.gif
