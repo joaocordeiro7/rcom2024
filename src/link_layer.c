@@ -42,7 +42,9 @@ volatile int STOP = FALSE;
 int alarmOn = FALSE;
 int alarmCount = 0;
 int timeout = 0; 
-
+int retransmissions = 0;
+char* serialPort = 0;
+LinkLayer currentLinkLayer;
 
 
 // Create a Supervision (S) or Unnumbered (U) Frame
@@ -106,6 +108,7 @@ int validateFrame(const unsigned char* frame, int length) {
 void alarmHandler(int signal) {
     alarmOn = TRUE;
     alarmCount++;
+    printf("Alarm triggered %d\n", alarmCount);
 }
 
 
@@ -123,7 +126,7 @@ int llopen(LinkLayer connectionParameters)
     unsigned char setFrame[5];
     unsigned char uaFrame[5];
     int retries = 0;
-    int timeout = connectionParameters.timeout;
+    currentLinkLayer = connectionParameters;
 
     // Create SET frame
     createSupervisionFrame(setFrame, A_SE, C_SET);
@@ -322,8 +325,204 @@ int llread(unsigned char *packet)
 ////////////////////////////////////////////////
 int llclose(int showStatistics)
 {
-    // TODO
+    // Initialize variables
+    State state = START;
+    unsigned char byte;
+    unsigned char frame[5];
+    int retries = 0;
+    int maxRetries = currentLinkLayer.nRetransmissions;
+    int timeout = currentLinkLayer.timeout;
+    int role = currentLinkLayer.role; // LlTx or LlRx
 
-    return 0;
+    // Set the alarm handler
+    (void) signal(SIGALRM, alarmHandler);
+
+    printf("Starting llclose, role: %s\n", (role == LlTx) ? "LlTx" : "LlRx");
+
+    while (retries < maxRetries && state != STOP_R)
+    {
+        if (role == LlTx)
+        {
+            // Transmitter: send DISC if in START state
+            if (state == START)
+            {
+                // Create and send DISC frame
+                createSupervisionFrame(frame, A_SE, C_DISC);
+                if (writeBytesSerialPort(frame, 5) < 0)
+                {
+                    printf("Failed to send DISC frame\n");
+                    return -1;
+                }
+                printf("Transmitter: DISC frame sent, waiting for DISC response...\n");
+            }
+        }
+        else if (role == LlRx && state == START)
+        {
+            printf("Receiver: Waiting for DISC frame from transmitter...\n");
+        }
+
+        // Set the alarm for timeout duration
+        alarmOn = FALSE;
+        alarm(timeout);
+
+        // State machine for handling communication
+        while (!alarmOn && state != STOP_R)
+        {
+            if (readByteSerialPort(&byte) > 0)
+            {
+                // State machine transitions
+                switch (state)
+                {
+                    case START:
+                        if (byte == FLAG) state = FLAG_RCV;
+                        break;
+                    case FLAG_RCV:
+                        if ((role == LlTx && byte == A_RE) || (role == LlRx && byte == A_SE))
+                            state = A_RCV;
+                        else if (byte != FLAG)
+                            state = START;
+                        break;
+                    case A_RCV:
+                        if (byte == C_DISC)
+                            state = C_RCV;
+                        else if (byte == FLAG)
+                            state = FLAG_RCV;
+                        else
+                            state = START;
+                        break;
+                    case C_RCV:
+                        if (byte == ((role == LlTx ? A_RE : A_SE) ^ C_DISC))
+                            state = BCC1_OK;
+                        else if (byte == FLAG)
+                            state = FLAG_RCV;
+                        else
+                            state = START;
+                        break;
+                    case BCC1_OK:
+                        if (byte == FLAG)
+                            state = STOP_R;
+                        else
+                            state = START;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // Disable the alarm
+        alarm(0);
+
+        // Retry if state is not STOP_R
+        if (state != STOP_R)
+        {
+            printf("Timeout occurred, retrying (%d/%d)\n", retries + 1, maxRetries);
+            retries++;
+        }
+    }
+
+    // Check if we reached STOP_R
+    if (state != STOP_R)
+    {
+        printf("Failed to complete DISC exchange, connection not closed properly.\n");
+        return -1;
+    }
+
+    if (role == LlTx)
+    {
+        // Transmitter: Send UA frame to acknowledge disconnection
+        createSupervisionFrame(frame, A_SE, C_UA);
+        if (writeBytesSerialPort(frame, 5) < 0)
+        {
+            printf("Failed to send UA frame\n");
+            return -1;
+        }
+        printf("Transmitter: UA frame sent, connection closed.\n");
+    }
+    else if (role == LlRx)
+    {
+        // Receiver: Send DISC and wait for UA
+        createSupervisionFrame(frame, A_RE, C_DISC);
+        if (writeBytesSerialPort(frame, 5) < 0)
+        {
+            printf("Failed to send DISC frame\n");
+            return -1;
+        }
+        printf("Receiver: DISC frame sent back, waiting for UA...\n");
+
+        // Wait for UA from the transmitter
+        state = START;
+        retries = 0;
+        while (retries < maxRetries && state != STOP_R)
+        {
+            alarmOn = FALSE;
+            alarm(timeout);
+
+            while (!alarmOn && state != STOP_R)
+            {
+                if (readByteSerialPort(&byte) > 0)
+                {
+                    switch (state)
+                    {
+                        case START:
+                            if (byte == FLAG) state = FLAG_RCV;
+                            break;
+                        case FLAG_RCV:
+                            if (byte == A_SE) state = A_RCV;
+                            else if (byte != FLAG) state = START;
+                            break;
+                        case A_RCV:
+                            if (byte == C_UA) state = C_RCV;
+                            else if (byte == FLAG) state = FLAG_RCV;
+                            else state = START;
+                            break;
+                        case C_RCV:
+                            if (byte == (A_SE ^ C_UA)) state = BCC1_OK;
+                            else if (byte == FLAG) state = FLAG_RCV;
+                            else state = START;
+                            break;
+                        case BCC1_OK:
+                            if (byte == FLAG) state = STOP_R;
+                            else state = START;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+
+            // Disable the alarm
+            alarm(0);
+
+            // Retry if state is not STOP_R
+            if (state != STOP_R)
+            {
+                printf("Timeout occurred, retrying to wait for UA (%d/%d)\n", retries + 1, maxRetries);
+                retries++;
+            }
+        }
+
+        if (state != STOP_R)
+        {
+            printf("Failed to receive final UA, connection not closed properly.\n");
+            return -1;
+        }
+
+        printf("Receiver: UA frame received, connection closed.\n");
+    }
+
+    // Optionally, show statistics if enabled
+    if (showStatistics)
+    {
+        printf("Connection statistics:\n");
+        printf("Number of retransmissions: %d\n", retries);
+    }
+
+    // Close the serial port
+    return closeSerialPort();
 }
+
+
+
+
 
