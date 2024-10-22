@@ -7,6 +7,7 @@
 #include <time.h>
 #include <termios.h>
 #include <unistd.h>
+#include <string.h>
 
 
 // Frame delimiters and constants
@@ -35,6 +36,7 @@ typedef enum {
     A_RCV,
     C_RCV,
     BCC1_OK,
+    DATA_RCV,
     STOP_R
 } State;
 
@@ -57,38 +59,58 @@ int createSupervisionFrame(unsigned char* frame, unsigned char address, unsigned
     return 5; // Length of the frame
 }
 
-// Create an Information (I) Frame
+// Create an Information (I) Frame with Byte Stuffing
 int createInformationFrame(unsigned char* frame, unsigned char address, unsigned char control, const unsigned char* data, int dataLength) {
-    int i;
-    frame[0] = FLAG;         // Start flag
-    frame[1] = address;      // Address field
-    frame[2] = control;      // Control field
-    frame[3] = address ^ control; // BCC1 (A XOR C)
-    
-    // Copy the data field
-    for (i = 0; i < dataLength; i++) {
-        frame[4 + i] = data[i];
+        if (dataLength > MAX_FRAME_SIZE - 6) { // Frame size check
+        printf("Error: Data too large for frame\n");
+        return -1;
     }
-    
-    // Calculate BCC2 (XOR of all data bytes)
+    int i;
+    frame[0] = FLAG;
+    frame[1] = address;
+    frame[2] = control;
+    frame[3] = address ^ control; // BCC1 (A XOR C)
+
+    // Copy data with byte stuffing
+    int stuffedLength = 4;
+    for (i = 0; i < dataLength; i++) {
+        if (data[i] == FLAG || data[i] == 0x7D) {
+            frame[stuffedLength++] = 0x7D;
+            frame[stuffedLength++] = data[i] ^ 0x20; // Byte stuffing
+        } else {
+            frame[stuffedLength++] = data[i];
+        }
+    }
+
+    // Calculate BCC2 (XOR of all data bytes before stuffing)
     unsigned char bcc2 = 0;
     for (i = 0; i < dataLength; i++) {
         bcc2 ^= data[i];
     }
-    frame[4 + dataLength] = bcc2; // BCC2
 
-    frame[5 + dataLength] = FLAG; // End flag
-    return 6 + dataLength; // Length of the frame
+    // Add BCC2 with byte stuffing
+    if (bcc2 == FLAG || bcc2 == 0x7D) {
+        frame[stuffedLength++] = 0x7D;
+        frame[stuffedLength++] = bcc2 ^ 0x20;
+    } else {
+        frame[stuffedLength++] = bcc2;
+    }
+
+    frame[stuffedLength++] = FLAG; // End flag
+    return stuffedLength;
 }
 
 // Validate a received frame
 int validateFrame(const unsigned char* frame, int length) {
     if (frame[0] != FLAG || frame[length - 1] != FLAG) {
+        printf("Frame validation failed: Invalid start or end FLAG\n");
         return -1; // Invalid start or end flag
     }
     
-    // Validate BCC1
+    // Validate BCC1 (A XOR C)
     if (frame[3] != (frame[1] ^ frame[2])) {
+        printf("Frame validation failed: BCC1 mismatch\n");
+        printf("Expected: 0x%02X, Actual: 0x%02X\n", frame[1] ^ frame[2], frame[3]);
         return -1; // BCC1 error
     }
     
@@ -99,9 +121,13 @@ int validateFrame(const unsigned char* frame, int length) {
             bcc2 ^= frame[i];
         }
         if (bcc2 != frame[length - 2]) {
+            printf("Frame validation failed: BCC2 mismatch\n");
+            printf("Expected BCC2: 0x%02X, Actual BCC2: 0x%02X\n", bcc2, frame[length - 2]);
             return -1; // BCC2 error
         }
     }
+    
+    printf("Frame validation successful\n");
     return 0; // Frame is valid
 }
 
@@ -150,6 +176,9 @@ int llopen(LinkLayer connectionParameters)
             // Set alarm for the timeout duration
             alarmOn = 0; // Reset alarm flag
             alarm(timeout); // Set the alarm to trigger after the specified timeout
+
+            alarmOn = 0;
+            alarm(connectionParameters.timeout);
 
             // State machine for receiving UA frame
             State state = START;
@@ -303,22 +332,211 @@ int llopen(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 // LLWRITE
 ////////////////////////////////////////////////
-int llwrite(const unsigned char *buf, int bufSize)
-{
-    // TODO
+int llwrite(const unsigned char *buf, int bufSize) {
+    static int Ns = 0; // Sequence number managed locally, initialized to 0
+    unsigned char frame[MAX_FRAME_SIZE];
+    unsigned char rrFrame[5]; // For receiving the RR or REJ frame
+    int retries = 0;
+    int frameSize;
+    int maxRetries = currentLinkLayer.nRetransmissions;
+    int timeout = currentLinkLayer.timeout;
+    State state;
 
-    return 0;
+    // Create the I-frame to send
+    frameSize = createInformationFrame(frame, A_SE, Ns << 6, buf, bufSize);
+
+    while (retries < maxRetries) {
+        // Send the I-frame
+        if (writeBytesSerialPort(frame, frameSize) < 0) {
+            printf("Failed to send I-frame\n");
+            return -1;
+        }
+        printf("I-frame sent, waiting for RR/REJ (Attempt %d)\n", retries + 1);
+
+        // Start the timer for the acknowledgment
+        alarmOn = FALSE;
+        alarm(timeout); // Set the timeout
+
+        // State machine for reading RR or REJ frame
+        state = START;
+        int bytesRead = 0;
+        unsigned char byte;
+
+        while (state != STOP_R && !alarmOn) {
+            int res = readByteSerialPort(&byte);
+            if (res > 0) {
+                rrFrame[bytesRead++] = byte; // Store the received byte
+
+                switch (state) {
+                    case START:
+                        if (byte == FLAG) state = FLAG_RCV;
+                        break;
+                    case FLAG_RCV:
+                        if (byte == A_RE) state = A_RCV; // Receiver's address
+                        else if (byte != FLAG) state = START;
+                        break;
+                    case A_RCV:
+                        if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1)
+                            state = C_RCV;
+                        else if (byte == FLAG) state = FLAG_RCV;
+                        else state = START;
+                        break;
+                    case C_RCV:
+                        if (byte == (A_RE ^ rrFrame[2])) state = BCC1_OK;
+                        else if (byte == FLAG) state = FLAG_RCV;
+                        else state = START;
+                        break;
+                    case BCC1_OK:
+                        if (byte == FLAG) state = STOP_R;
+                        else state = START;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // Disable the alarm
+        alarm(0);
+
+        // Check if we received a valid RR or REJ frame
+        if (state == STOP_R && validateFrame(rrFrame, 5) == 0) {
+            if (rrFrame[2] == C_RR0 || rrFrame[2] == C_RR1) {
+                printf("Received RR frame, data acknowledged\n");
+                Ns = (Ns + 1) % 2;  // Toggle sequence number
+                return bufSize; // Data sent successfully
+            } else if (rrFrame[2] == C_REJ0 || rrFrame[2] == C_REJ1) {
+                printf("Received REJ frame, retransmitting...\n");
+                retries++;
+            }
+        } else {
+            printf("Timeout or invalid frame received, retransmitting (Attempt %d)\n", retries + 1);
+            retries++;
+        }
+    }
+
+    printf("Failed to send data after %d attempts\n", retries);
+    return -1;
 }
 
+
+int byteUnstuffing(const unsigned char *input, int length, unsigned char *output) {
+    int j = 0;
+    for (int i = 0; i < length; i++) {
+        if (input[i] == 0x7D) { // Escape character
+            i++; // Skip next byte for unstuffing
+            output[j++] = input[i] ^ 0x20; // Unstuff by XORing with 0x20
+        } else {
+            output[j++] = input[i];
+        }
+    }
+    return j; // Return the new length after unstuffing
+}
 ////////////////////////////////////////////////
 // LLREAD
 ////////////////////////////////////////////////
-int llread(unsigned char *packet)
-{
-    // TODO
+int llread(unsigned char *packet) {
+    State state = START;
+    unsigned char byte;
+    unsigned char frame[MAX_FRAME_SIZE];
+    unsigned char unstuffedFrame[MAX_FRAME_SIZE];
+    int bytesRead = 0;
+    int dataIndex = 4; // Start placing data after the header fields
 
-    return 0;
+    // State machine to read an I-frame
+    while (state != STOP_R) {
+        int res = readByteSerialPort(&byte);
+        if (res > 0) {
+            if (bytesRead >= MAX_FRAME_SIZE) {
+                printf("Error: Frame buffer overflow\n");
+                return -1;
+            }
+            frame[bytesRead++] = byte;
+
+            // Debugging output: print the current state and the byte received
+            printf("Current state: %d, Received byte: 0x%02X\n", state, byte);
+
+            switch (state) {
+                case START:
+                    if (byte == FLAG) state = FLAG_RCV;
+                    break;
+
+                case FLAG_RCV:
+                    if (byte == A_SE) state = A_RCV;
+                    else if (byte != FLAG) state = START;
+                    break;
+
+                case A_RCV:
+                    if ((byte >> 6) == 0 || (byte >> 6) == 1) { // Ns = 0 or 1
+                        state = C_RCV;
+                    } else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break;
+
+                case C_RCV:
+                    if (byte == (A_SE ^ frame[2])) state = BCC1_OK;
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break;
+
+                case BCC1_OK:
+                    if (byte != FLAG) {
+                        state = DATA_RCV;
+                        frame[dataIndex++] = byte; // Store data
+                    } else {
+                        state = STOP_R;
+                    }
+                    break;
+
+                case DATA_RCV:
+                    if (byte == FLAG) {
+                        printf("End FLAG detected, transitioning to STOP_R\n");
+                        state = STOP_R;  // End of frame
+                    } else {
+                        printf("Received data byte: 0x%02X\n", byte);
+                        frame[dataIndex++] = byte;
+                    }
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    }
+
+    // Unstuff the frame before BCC2 validation
+    int unstuffedLength = byteUnstuffing(frame, bytesRead, unstuffedFrame);
+
+    // Validate the frame after exiting the state machine
+    if (validateFrame(unstuffedFrame, unstuffedLength) != 0) {
+        printf("Invalid I-frame received\n");
+        return -1;
+    }
+
+    // Send RR acknowledgment back to the transmitter
+    unsigned char rrFrame[5];
+    createSupervisionFrame(rrFrame, A_RE, C_RR0);  // Acknowledge with RR0
+    if (writeBytesSerialPort(rrFrame, 5) < 0) {
+        printf("Failed to send RR frame\n");
+        return -1;
+    }
+    printf("RR frame sent, acknowledgment complete.\n");
+
+    // Ensure we copy only the data, not the header or BCC
+    if (unstuffedLength - 6 <= 0) {
+        printf("Error: No valid data in the frame.\n");
+        return -1;
+    }
+
+    // Extract data and store it in the packet (exclude header and BCC)
+    memcpy(packet, &unstuffedFrame[4], unstuffedLength - 6);  // Copy data from the frame (exclude BCC2 and FLAG)
+
+    return unstuffedLength - 6;  // Return the number of bytes read
 }
+
+
+
+
 
 ////////////////////////////////////////////////
 // LLCLOSE
@@ -521,8 +739,3 @@ int llclose(int showStatistics)
     // Close the serial port
     return closeSerialPort();
 }
-
-
-
-
-
