@@ -23,6 +23,7 @@
 #define C_REJ0 0x54
 #define C_REJ1 0x55
 #define C_DISC 0x0B
+#define ESC 0x7D
 
 // Maximum frame size
 #define MAX_FRAME_SIZE 1024
@@ -74,8 +75,8 @@ int createInformationFrame(unsigned char* frame, unsigned char address, unsigned
     // Copy data with byte stuffing
     int stuffedLength = 4;
     for (i = 0; i < dataLength; i++) {
-        if (data[i] == FLAG || data[i] == 0x7D) {
-            frame[stuffedLength++] = 0x7D;
+        if (data[i] == FLAG || data[i] == ESC) {
+            frame[stuffedLength++] = ESC;
             frame[stuffedLength++] = data[i] ^ 0x20; // Byte stuffing
         } else {
             frame[stuffedLength++] = data[i];
@@ -89,8 +90,8 @@ int createInformationFrame(unsigned char* frame, unsigned char address, unsigned
     }
 
     // Add BCC2 with byte stuffing
-    if (bcc2 == FLAG || bcc2 == 0x7D) {
-        frame[stuffedLength++] = 0x7D;
+    if (bcc2 == FLAG || bcc2 == ESC) {
+        frame[stuffedLength++] = ESC;
         frame[stuffedLength++] = bcc2 ^ 0x20;
     } else {
         frame[stuffedLength++] = bcc2;
@@ -423,7 +424,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
 int byteUnstuffing(const unsigned char *input, int length, unsigned char *output) {
     int j = 0;
     for (int i = 0; i < length; i++) {
-        if (input[i] == 0x7D) { // Escape character
+        if (input[i] == ESC) { // Escape character
             i++; // Skip next byte for unstuffing
             output[j++] = input[i] ^ 0x20; // Unstuff by XORing with 0x20
         } else {
@@ -442,6 +443,7 @@ int llread(unsigned char *packet) {
     unsigned char unstuffedFrame[MAX_FRAME_SIZE];
     int bytesRead = 0;
     int dataIndex = 4; // Start placing data after the header fields
+    static int expectedNs = 0; // Expected sequence number (0 or 1)
 
     // State machine to read an I-frame
     while (state != STOP_R) {
@@ -467,7 +469,7 @@ int llread(unsigned char *packet) {
                     break;
 
                 case A_RCV:
-                    if ((byte >> 6) == 0 || (byte >> 6) == 1) { // Ns = 0 or 1
+                    if ((byte == (expectedNs << 6)) || (byte == ((1 - expectedNs) << 6))) {
                         state = C_RCV;
                     } else if (byte == FLAG) state = FLAG_RCV;
                     else state = START;
@@ -490,10 +492,8 @@ int llread(unsigned char *packet) {
 
                 case DATA_RCV:
                     if (byte == FLAG) {
-                        printf("End FLAG detected, transitioning to STOP_R\n");
                         state = STOP_R;  // End of frame
                     } else {
-                        printf("Received data byte: 0x%02X\n", byte);
                         frame[dataIndex++] = byte;
                     }
                     break;
@@ -509,18 +509,24 @@ int llread(unsigned char *packet) {
 
     // Validate the frame after exiting the state machine
     if (validateFrame(unstuffedFrame, unstuffedLength) != 0) {
-        printf("Invalid I-frame received\n");
+        printf("Invalid I-frame received, sending REJ\n");
+        unsigned char rejFrame[5];
+        createSupervisionFrame(rejFrame, A_RE, (expectedNs == 0) ? C_REJ0 : C_REJ1);
+        writeBytesSerialPort(rejFrame, 5); // Send REJ
         return -1;
     }
 
     // Send RR acknowledgment back to the transmitter
     unsigned char rrFrame[5];
-    createSupervisionFrame(rrFrame, A_RE, C_RR0);  // Acknowledge with RR0
+    createSupervisionFrame(rrFrame, A_RE, (expectedNs == 0) ? C_RR0 : C_RR1);
     if (writeBytesSerialPort(rrFrame, 5) < 0) {
         printf("Failed to send RR frame\n");
         return -1;
     }
     printf("RR frame sent, acknowledgment complete.\n");
+
+    // Toggle the expected sequence number
+    expectedNs = 1 - expectedNs;
 
     // Ensure we copy only the data, not the header or BCC
     if (unstuffedLength - 6 <= 0) {
