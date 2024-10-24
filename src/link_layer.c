@@ -135,6 +135,7 @@ int validateFrame(const unsigned char* frame, int length) {
 void alarmHandler(int signal) {
     alarmOn = TRUE;
     alarmCount++;
+    //timemouts
     printf("Alarm triggered %d\n", alarmCount);
 }
 
@@ -455,9 +456,6 @@ int llread(unsigned char *packet) {
             }
             frame[bytesRead++] = byte;
 
-            // Debugging output: print the current state and the byte received
-            printf("Current state: %d, Received byte: 0x%02X\n", state, byte);
-
             switch (state) {
                 case START:
                     if (byte == FLAG) state = FLAG_RCV;
@@ -503,6 +501,7 @@ int llread(unsigned char *packet) {
             }
         }
     }
+
 
     // Unstuff the frame before BCC2 validation
     int unstuffedLength = byteUnstuffing(frame, bytesRead, unstuffedFrame);
