@@ -11,40 +11,37 @@
 
 int createControlPacket(unsigned char *packet, const char *filename, int fileSize, int isStart) {
     int index = 0;
-    packet[index++] = isStart ? 0x02 : 0x03; // 0x02 for START, 0x03 for END
+    packet[index++] = isStart ? 0x02 : 0x03; 
 
-    // File size
-    packet[index++] = 0x00; // Indicating that this is a file size field
-    packet[index++] = sizeof(fileSize); // Length of the file size field
+    packet[index++] = 0x00; 
+    packet[index++] = sizeof(fileSize); 
     memcpy(&packet[index], &fileSize, sizeof(fileSize));
     index += sizeof(fileSize);
 
-    // Filename
+    
     int filenameLength = strlen(filename);
-    packet[index++] = 0x01; // Indicating that this is a filename field
-    packet[index++] = filenameLength; // Length of the filename field
+    packet[index++] = 0x01; 
+    packet[index++] = filenameLength; 
     memcpy(&packet[index], filename, filenameLength);
     index += filenameLength;
 
-    return index; // Total packet length
+    return index; 
 }
 
 
 int createDataPacket(unsigned char *packet, int sequenceNumber, const unsigned char *data, int dataLength) {
     int index = 0;
-    packet[index++] = 0x01; // DATA packet type
+    packet[index++] = 0x01; 
 
-    packet[index++] = sequenceNumber; // Sequence number
+    packet[index++] = sequenceNumber; 
 
-    // Data length
-    packet[index++] = (dataLength >> 8) & 0xFF; // High byte of length
-    packet[index++] = dataLength & 0xFF;        // Low byte of length
+    packet[index++] = (dataLength >> 8) & 0xFF; 
+    packet[index++] = dataLength & 0xFF;        
 
-    // Copy the data itself
     memcpy(&packet[index], data, dataLength);
     index += dataLength;
 
-    return index; // Total packet length
+    return index; 
 }
 
 
@@ -52,14 +49,12 @@ int createDataPacket(unsigned char *packet, int sequenceNumber, const unsigned c
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
-    // Set up the LinkLayer configuration
     LinkLayer connectionParameters;
     strncpy(connectionParameters.serialPort, serialPort, sizeof(connectionParameters.serialPort));
     connectionParameters.baudRate = baudRate;
     connectionParameters.nRetransmissions = nTries;
     connectionParameters.timeout = timeout;
 
-    // Set the role based on the "role" parameter
     if (strcmp(role, "tx") == 0) {
         connectionParameters.role = LlTx;
     } else if (strcmp(role, "rx") == 0) {
@@ -69,7 +64,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         return;
     }
 
-    // Test the llopen function
     printf("Testing llopen...\n");
     if (llopen(connectionParameters) < 0) {
         printf("Failed to open the connection using llopen\n");
@@ -78,7 +72,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
     printf("Connection established using llopen\n");
 
     if (connectionParameters.role == LlTx) {
-        // Transmitter (Tx) role: Send file data
         FILE *file = fopen(filename, "rb");
         if (!file) {
             printf("Failed to open file: %s\n", filename);
@@ -86,7 +79,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             return;
         }
 
-        // Prepare the START control packet
         unsigned char controlPacket[MAX_FRAME_SIZE];
         int fileSize;
         fseek(file, 0, SEEK_END);
@@ -94,7 +86,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         fseek(file, 0, SEEK_SET);
         int controlPacketLength = createControlPacket(controlPacket, filename, fileSize, 1);
 
-        // Send the START control packet
         if (llwrite(controlPacket, controlPacketLength) < 0) {
             printf("Failed to send START control packet\n");
             fclose(file);
@@ -103,18 +94,15 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         }
         printf("START control packet sent\n");
 
-        // Send the file data in DATA packets
         unsigned char dataBuffer[256];
         int bytesRead;
         int sequenceNumber = 0;
 
         printf("Sending file data using DATA packets...\n");
         while ((bytesRead = fread(dataBuffer, 1, sizeof(dataBuffer), file)) > 0) {
-            // Create the DATA packet
             unsigned char dataPacket[MAX_FRAME_SIZE];
             int dataPacketLength = createDataPacket(dataPacket, sequenceNumber, dataBuffer, bytesRead);
 
-            // Send the DATA packet
             if (llwrite(dataPacket, dataPacketLength) < 0) {
                 printf("Failed to send DATA packet\n");
                 fclose(file);
@@ -123,11 +111,9 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             }
             printf("Sent DATA packet with sequence number: %d, size: %d bytes\n", sequenceNumber, bytesRead);
 
-            // Toggle sequence number between 0 and 1
             sequenceNumber = (sequenceNumber + 1) % 2;
         }
 
-        // Send the END control packet
         controlPacketLength = createControlPacket(controlPacket, filename, fileSize, 0);
         if (llwrite(controlPacket, controlPacketLength) < 0) {
             printf("Failed to send END control packet\n");
@@ -137,13 +123,11 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         }
         printf("END control packet sent\n");
 
-        // Close the file
         fclose(file);
         printf("File transmission complete\n");
     }
 
     if (connectionParameters.role == LlRx) {
-        // Receiver (Rx) role: Receive file data
         FILE *file = fopen(filename, "wb");
         if (!file) {
             printf("Failed to open file for writing: %s\n", filename);
@@ -186,7 +170,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         printf("File reception complete\n");
     }
 
-    // Close the connection
     printf("Testing llclose...\n");
     if (llclose(0) < 0) {
         printf("Failed to close the connection using llclose\n");
