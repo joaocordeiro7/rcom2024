@@ -423,12 +423,12 @@ int llwrite(const unsigned char *buf, int bufSize) {
             } else if (rrFrame[2] == C_REJ0 || rrFrame[2] == C_REJ1) {
                 frames_received++;
                 printf("Received REJ frame, retransmitting...\n");
-                maxRetries++;  // Increase retry counter for REJ retransmissions
+                retries = 0;  // Increase retry counter for REJ retransmissions
             }
         } else {
             // If timeout or no valid RR/REJ received
             printf("Timeout or invalid frame received, retrying transmission\n");
-            maxRetries++;
+            retries++;
         }
     }
 
@@ -472,9 +472,6 @@ int llread(unsigned char *packet) {
                 bytesRead = 0;
                 state = START;
                 dataIndex = 4;
-
-                // Clear the input buffer to remove any lingering bytes
-                tcflush(serialFd, TCIFLUSH); // This will need to reference your serial port descriptor
                 continue;
             }
 
@@ -483,24 +480,41 @@ int llread(unsigned char *packet) {
             switch (state) {
                 case START:
                     if (byte == FLAG) state = FLAG_RCV;
+                    else bytesRead = 0;
                     break;
 
                 case FLAG_RCV:
                     if (byte == A_SE) state = A_RCV;
-                    else if (byte != FLAG) state = START;
+                    else if (byte != FLAG) {
+                        state = START;
+                        bytesRead = 0;
+                    }
+                    else bytesRead = 1;
                     break;
 
                 case A_RCV:
                     if ((byte == (expectedNs << 6)) || (byte == ((1 - expectedNs) << 6))) {
                         state = C_RCV;
-                    } else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
+                    } else if (byte == FLAG) {
+                        state = FLAG_RCV;
+                        bytesRead = 1;
+                    }
+                    else {
+                        state = START;
+                        bytesRead = 0;
+                    }
                     break;
 
                 case C_RCV:
                     if (byte == (A_SE ^ frame[2])) state = BCC1_OK;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
+                    else if (byte == FLAG) {
+                        state = FLAG_RCV;
+                        bytesRead = 1;
+                    }
+                    else {
+                        state = START;
+                        bytesRead = 0;
+                    }
                     break;
 
                 case BCC1_OK:
@@ -538,9 +552,6 @@ int llread(unsigned char *packet) {
                 frames_sent++;
                 writeBytesSerialPort(rejFrame, 5);
 
-                // Clear input buffer to ensure fresh data on retry
-                tcflush(serialFd, TCIFLUSH); // Adjust to match your serial port descriptor
-
                 // Reset buffer and state for retransmission
                 bytesRead = 0;
                 state = START;
@@ -574,12 +585,6 @@ int llread(unsigned char *packet) {
     }
     return -1;
 }
-
-
-
-
-
-
 
 
 ////////////////////////////////////////////////
