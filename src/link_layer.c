@@ -48,7 +48,7 @@ int timeout = 0;
 int retransmissions = 0;
 char* serialPort = 0;
 LinkLayer currentLinkLayer;
-
+int serialFd = -1;
 
 // Create a Supervision (S) or Unnumbered (U) Frame
 int createSupervisionFrame(unsigned char* frame, unsigned char address, unsigned char control) {
@@ -145,7 +145,9 @@ void alarmHandler(int signal) {
 ////////////////////////////////////////////////
 int llopen(LinkLayer connectionParameters)
 {
-    if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) < 0)
+    serialFd = openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate);
+
+    if (serialFd < 0)
     {
         return -1;
     }
@@ -335,7 +337,7 @@ int llopen(LinkLayer connectionParameters)
 // LLWRITE
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize) {
-    static int Ns = 0; // Sequence number managed locally, initialized to 0
+    static int Ns = 0; // Sequence number
     unsigned char frame[MAX_FRAME_SIZE];
     unsigned char rrFrame[5]; // For receiving the RR or REJ frame
     int retries = 0;
@@ -355,32 +357,34 @@ int llwrite(const unsigned char *buf, int bufSize) {
         }
         printf("I-frame sent, waiting for RR/REJ (Attempt %d)\n", retries + 1);
 
-        // Start the timer for the acknowledgment
+        // Reset the alarm and start waiting for RR/REJ response
         alarmOn = FALSE;
-        alarm(timeout); // Set the timeout
+        alarm(timeout); // Set the alarm
 
         // State machine for reading RR or REJ frame
         state = START;
         int bytesRead = 0;
         unsigned char byte;
+        //int receivedResponse = 0;
 
         while (state != STOP_R && !alarmOn) {
             int res = readByteSerialPort(&byte);
             if (res > 0) {
-                rrFrame[bytesRead++] = byte; // Store the received byte
+                rrFrame[bytesRead++] = byte;
 
+                // State machine transitions for RR or REJ
                 switch (state) {
                     case START:
                         if (byte == FLAG) state = FLAG_RCV;
                         break;
                     case FLAG_RCV:
-                        if (byte == A_RE) state = A_RCV; // Receiver's address
+                        if (byte == A_RE) state = A_RCV;
                         else if (byte != FLAG) state = START;
                         break;
                     case A_RCV:
-                        if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1)
+                        if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1) {
                             state = C_RCV;
-                        else if (byte == FLAG) state = FLAG_RCV;
+                        } else if (byte == FLAG) state = FLAG_RCV;
                         else state = START;
                         break;
                     case C_RCV:
@@ -398,28 +402,29 @@ int llwrite(const unsigned char *buf, int bufSize) {
             }
         }
 
-        // Disable the alarm
-        alarm(0);
+        alarm(0); // Disable alarm to avoid premature timeout handling
 
-        // Check if we received a valid RR or REJ frame
         if (state == STOP_R && validateFrame(rrFrame, 5) == 0) {
             if (rrFrame[2] == C_RR0 || rrFrame[2] == C_RR1) {
                 printf("Received RR frame, data acknowledged\n");
-                Ns = (Ns + 1) % 2;  // Toggle sequence number
-                return bufSize; // Data sent successfully
+                Ns = (Ns + 1) % 2; // Toggle sequence number
+                return bufSize;
             } else if (rrFrame[2] == C_REJ0 || rrFrame[2] == C_REJ1) {
                 printf("Received REJ frame, retransmitting...\n");
-                retries++;
+                maxRetries++;  // Increase retry counter for REJ retransmissions
             }
         } else {
-            printf("Timeout or invalid frame received, retransmitting (Attempt %d)\n", retries + 1);
-            retries++;
+            // If timeout or no valid RR/REJ received
+            printf("Timeout or invalid frame received, retrying transmission\n");
+            maxRetries++;
         }
     }
 
     printf("Failed to send data after %d attempts\n", retries);
     return -1;
 }
+
+
 
 
 int byteUnstuffing(const unsigned char *input, int length, unsigned char *output) {
@@ -447,13 +452,20 @@ int llread(unsigned char *packet) {
     static int expectedNs = 0; // Expected sequence number (0 or 1)
 
     // State machine to read an I-frame
-    while (state != STOP_R) {
+    while (1) {
         int res = readByteSerialPort(&byte);
         if (res > 0) {
             if (bytesRead >= MAX_FRAME_SIZE) {
-                printf("Error: Frame buffer overflow\n");
-                return -1;
+                printf("Error: Frame buffer overflow. Resetting buffer and awaiting retransmission.\n");
+                bytesRead = 0;
+                state = START;
+                dataIndex = 4;
+
+                // Clear the input buffer to remove any lingering bytes
+                tcflush(serialFd, TCIFLUSH); // This will need to reference your serial port descriptor
+                continue;
             }
+
             frame[bytesRead++] = byte;
 
             switch (state) {
@@ -482,7 +494,7 @@ int llread(unsigned char *packet) {
                 case BCC1_OK:
                     if (byte != FLAG) {
                         state = DATA_RCV;
-                        frame[dataIndex++] = byte; // Store data
+                        frame[dataIndex++] = byte;
                     } else {
                         state = STOP_R;
                     }
@@ -500,44 +512,56 @@ int llread(unsigned char *packet) {
                     break;
             }
         }
+
+        // Once STOP_R is reached, unstuff and validate
+        if (state == STOP_R) {
+            int unstuffedLength = byteUnstuffing(frame, bytesRead, unstuffedFrame);
+
+            // Validate the frame
+            if (validateFrame(unstuffedFrame, unstuffedLength) != 0) {
+                printf("Invalid I-frame received, sending REJ\n");
+                unsigned char rejFrame[5];
+                createSupervisionFrame(rejFrame, A_RE, (expectedNs == 0) ? C_REJ0 : C_REJ1);
+                writeBytesSerialPort(rejFrame, 5);
+
+                // Clear input buffer to ensure fresh data on retry
+                tcflush(serialFd, TCIFLUSH); // Adjust to match your serial port descriptor
+
+                // Reset buffer and state for retransmission
+                bytesRead = 0;
+                state = START;
+                dataIndex = 4;
+                continue; // Wait for the retransmitted frame
+            }
+
+            // Send RR if validation is successful
+            unsigned char rrFrame[5];
+            createSupervisionFrame(rrFrame, A_RE, (expectedNs == 0) ? C_RR0 : C_RR1);
+            if (writeBytesSerialPort(rrFrame, 5) < 0) {
+                printf("Failed to send RR frame\n");
+                return -1;
+            }
+            printf("RR frame sent, acknowledgment complete.\n");
+
+            // Toggle expected sequence number
+            expectedNs = 1 - expectedNs;
+
+            if (unstuffedLength - 6 <= 0) {
+                printf("Error: No valid data in the frame.\n");
+                return -1;
+            }
+
+            // Extract data and store it in packet (excluding header and BCC)
+            memcpy(packet, &unstuffedFrame[4], unstuffedLength - 6);
+
+            return unstuffedLength - 6;  // Return the number of bytes read
+        }
     }
-
-
-    // Unstuff the frame before BCC2 validation
-    int unstuffedLength = byteUnstuffing(frame, bytesRead, unstuffedFrame);
-
-    // Validate the frame after exiting the state machine
-    if (validateFrame(unstuffedFrame, unstuffedLength) != 0) {
-        printf("Invalid I-frame received, sending REJ\n");
-        unsigned char rejFrame[5];
-        createSupervisionFrame(rejFrame, A_RE, (expectedNs == 0) ? C_REJ0 : C_REJ1);
-        writeBytesSerialPort(rejFrame, 5); // Send REJ
-        return -1;
-    }
-
-    // Send RR acknowledgment back to the transmitter
-    unsigned char rrFrame[5];
-    createSupervisionFrame(rrFrame, A_RE, (expectedNs == 0) ? C_RR0 : C_RR1);
-    if (writeBytesSerialPort(rrFrame, 5) < 0) {
-        printf("Failed to send RR frame\n");
-        return -1;
-    }
-    printf("RR frame sent, acknowledgment complete.\n");
-
-    // Toggle the expected sequence number
-    expectedNs = 1 - expectedNs;
-
-    // Ensure we copy only the data, not the header or BCC
-    if (unstuffedLength - 6 <= 0) {
-        printf("Error: No valid data in the frame.\n");
-        return -1;
-    }
-
-    // Extract data and store it in the packet (exclude header and BCC)
-    memcpy(packet, &unstuffedFrame[4], unstuffedLength - 6);  // Copy data from the frame (exclude BCC2 and FLAG)
-
-    return unstuffedLength - 6;  // Return the number of bytes read
+    return -1;
 }
+
+
+
 
 
 
