@@ -8,6 +8,7 @@
 
 #define MAX_FRAME_SIZE 1024
 
+int statisticsEnabled = 1;
 
 int createControlPacket(unsigned char *packet, const char *filename, int fileSize, int isStart) {
     int index = 0;
@@ -82,7 +83,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         FILE *file = fopen(filename, "rb");
         if (!file) {
             printf("Failed to open file: %s\n", filename);
-            llclose(0);
+            llclose(statisticsEnabled);
             return;
         }
 
@@ -98,7 +99,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         if (llwrite(controlPacket, controlPacketLength) < 0) {
             printf("Failed to send START control packet\n");
             fclose(file);
-            llclose(0);
+            llclose(statisticsEnabled);
             return;
         }
         printf("START control packet sent\n");
@@ -118,7 +119,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             if (llwrite(dataPacket, dataPacketLength) < 0) {
                 printf("Failed to send DATA packet\n");
                 fclose(file);
-                llclose(0);
+                llclose(statisticsEnabled);
                 return;
             }
             printf("Sent DATA packet with sequence number: %d, size: %d bytes\n", sequenceNumber, bytesRead);
@@ -132,7 +133,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         if (llwrite(controlPacket, controlPacketLength) < 0) {
             printf("Failed to send END control packet\n");
             fclose(file);
-            llclose(0);
+            llclose(statisticsEnabled);
             return;
         }
         printf("END control packet sent\n");
@@ -147,7 +148,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         FILE *file = fopen(filename, "wb");
         if (!file) {
             printf("Failed to open file for writing: %s\n", filename);
-            llclose(0);
+            llclose(statisticsEnabled);
             return;
         }
 
@@ -188,7 +189,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
     // Close the connection
     printf("Testing llclose...\n");
-    if (llclose(0) < 0) {
+    if (llclose(statisticsEnabled) < 0) {
         printf("Failed to close the connection using llclose\n");
         return;
     }

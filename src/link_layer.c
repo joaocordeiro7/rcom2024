@@ -49,6 +49,9 @@ int retransmissions = 0;
 char* serialPort = 0;
 LinkLayer currentLinkLayer;
 int serialFd = -1;
+time_t start_time, end_time;
+int frames_sent = 0;
+int frames_received = 0;
 
 // Create a Supervision (S) or Unnumbered (U) Frame
 int createSupervisionFrame(unsigned char* frame, unsigned char address, unsigned char control) {
@@ -169,6 +172,7 @@ int llopen(LinkLayer connectionParameters)
         while (retries < connectionParameters.nRetransmissions)
         {
             // Send SET frame
+            frames_sent++;
             if (writeBytesSerialPort(setFrame, 5) < 0)
             {
                 printf("Failed to send SET frame\n");
@@ -236,7 +240,9 @@ int llopen(LinkLayer connectionParameters)
             if (state == STOP_R && validateFrame(uaFrame, 5) == 0)
             {
                 // Received valid UA
+                frames_received++;
                 printf("UA frame received, connection established.\n");
+                time(&start_time);
                 return 1;
             }
             else
@@ -306,12 +312,14 @@ int llopen(LinkLayer connectionParameters)
             if (state == STOP_R && validateFrame(setFrame, 5) == 0)
             {
                 // Received valid SET
+                frames_received++;
                 printf("SET frame received, sending UA...\n");
 
                 // Create UA frame
                 createSupervisionFrame(uaFrame, A_RE, C_UA);
 
                 // Send UA frame
+                frames_sent++;
                 if (writeBytesSerialPort(uaFrame, 5) < 0)
                 {
                     printf("Failed to send UA frame\n");
@@ -319,6 +327,7 @@ int llopen(LinkLayer connectionParameters)
                 }
 
                 printf("UA frame sent, connection established.\n");
+                time(&start_time);
                 return 1;
             }
         }
@@ -351,6 +360,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
 
     while (retries < maxRetries) {
         // Send the I-frame
+        frames_sent++;
         if (writeBytesSerialPort(frame, frameSize) < 0) {
             printf("Failed to send I-frame\n");
             return -1;
@@ -406,10 +416,12 @@ int llwrite(const unsigned char *buf, int bufSize) {
 
         if (state == STOP_R && validateFrame(rrFrame, 5) == 0) {
             if (rrFrame[2] == C_RR0 || rrFrame[2] == C_RR1) {
+                frames_received++;
                 printf("Received RR frame, data acknowledged\n");
                 Ns = (Ns + 1) % 2; // Toggle sequence number
                 return bufSize;
             } else if (rrFrame[2] == C_REJ0 || rrFrame[2] == C_REJ1) {
+                frames_received++;
                 printf("Received REJ frame, retransmitting...\n");
                 maxRetries++;  // Increase retry counter for REJ retransmissions
             }
@@ -519,9 +531,11 @@ int llread(unsigned char *packet) {
 
             // Validate the frame
             if (validateFrame(unstuffedFrame, unstuffedLength) != 0) {
+                frames_received++;
                 printf("Invalid I-frame received, sending REJ\n");
                 unsigned char rejFrame[5];
                 createSupervisionFrame(rejFrame, A_RE, (expectedNs == 0) ? C_REJ0 : C_REJ1);
+                frames_sent++;
                 writeBytesSerialPort(rejFrame, 5);
 
                 // Clear input buffer to ensure fresh data on retry
@@ -533,10 +547,11 @@ int llread(unsigned char *packet) {
                 dataIndex = 4;
                 continue; // Wait for the retransmitted frame
             }
-
+            frames_received++;
             // Send RR if validation is successful
             unsigned char rrFrame[5];
             createSupervisionFrame(rrFrame, A_RE, (expectedNs == 0) ? C_RR0 : C_RR1);
+            frames_sent++;
             if (writeBytesSerialPort(rrFrame, 5) < 0) {
                 printf("Failed to send RR frame\n");
                 return -1;
@@ -595,6 +610,7 @@ int llclose(int showStatistics)
             {
                 // Create and send DISC frame
                 createSupervisionFrame(frame, A_SE, C_DISC);
+                frames_sent++;
                 if (writeBytesSerialPort(frame, 5) < 0)
                 {
                     printf("Failed to send DISC frame\n");
@@ -674,11 +690,13 @@ int llclose(int showStatistics)
         printf("Failed to complete DISC exchange, connection not closed properly.\n");
         return -1;
     }
+    frames_received++;
 
     if (role == LlTx)
     {
         // Transmitter: Send UA frame to acknowledge disconnection
         createSupervisionFrame(frame, A_SE, C_UA);
+        frames_sent++;
         if (writeBytesSerialPort(frame, 5) < 0)
         {
             printf("Failed to send UA frame\n");
@@ -690,6 +708,7 @@ int llclose(int showStatistics)
     {
         // Receiver: Send DISC and wait for UA
         createSupervisionFrame(frame, A_RE, C_DISC);
+        frames_sent++;
         if (writeBytesSerialPort(frame, 5) < 0)
         {
             printf("Failed to send DISC frame\n");
@@ -754,15 +773,21 @@ int llclose(int showStatistics)
             printf("Failed to receive final UA, connection not closed properly.\n");
             return -1;
         }
-
+        frames_received++;
         printf("Receiver: UA frame received, connection closed.\n");
     }
 
     // Optionally, show statistics if enabled
     if (showStatistics)
     {
+        time(&end_time);
+        double total_time = end_time - start_time;
         printf("Connection statistics:\n");
+        printf("Total transference time elapsed: %.2f seconds\n", total_time);
         printf("Number of retransmissions: %d\n", retries);
+        printf("Number of timeouts: %d\n", alarmCount);
+        printf("Frames sent: %d\n", frames_sent);
+        printf("Frames received: %d\n", frames_received);
     }
 
     // Close the serial port
