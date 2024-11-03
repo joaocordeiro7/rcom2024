@@ -52,6 +52,7 @@ int serialFd = -1;
 time_t start_time, end_time;
 int frames_sent = 0;
 int frames_received = 0;
+int all_retries = 0;
 
 // create a supervision (S) or unnumbered (U) frame
 int createSupervisionFrame(unsigned char* frame, unsigned char address, unsigned char control) {
@@ -239,6 +240,7 @@ int llopen(LinkLayer connectionParameters)
             // no UA received or invalid UA -> retry
             printf("Retry %d: Resending SET frame...\n", retries + 1);
             retries++;
+            all_retries++;
         }
 
         printf("Connection failed after %d attempts\n", retries);
@@ -408,6 +410,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
         } else {
             printf("Timeout or invalid frame received, retrying transmission\n");
             retries++;
+            all_retries++;
         }
     }
 
@@ -649,6 +652,7 @@ int llclose(int showStatistics)
         {
             printf("Timeout occurred, retrying (%d/%d)\n", retries + 1, maxRetries);
             retries++;
+            all_retries++;
         }
     }
 
@@ -728,10 +732,11 @@ int llclose(int showStatistics)
 
             alarm(0);
 
-            if (state != STOP_R)
+            if (state != STOP_R)    
             {
                 printf("Timeout occurred, retrying to wait for UA (%d/%d)\n", retries + 1, maxRetries);
                 retries++;
+                all_retries++;
             }
         }
 
@@ -750,7 +755,7 @@ int llclose(int showStatistics)
         double total_time = end_time - start_time;
         printf("Connection statistics:\n");
         printf("Total transference time elapsed: %.2f seconds\n", total_time);
-        printf("Number of retransmissions: %d\n", retries);
+        printf("Number of retransmissions: %d\n", all_retries);
         printf("Number of timeouts: %d\n", alarmCount);
         printf("Frames sent: %d\n", frames_sent);
         printf("Frames received: %d\n", frames_received);
